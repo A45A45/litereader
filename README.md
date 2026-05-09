@@ -1,5 +1,5 @@
 # litereader
-Minimal Terminal E-book Reader
+Minimal Terminal E-book Reader - supports .txt and .pdf format
 
 ## Controls
 
