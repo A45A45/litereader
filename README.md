@@ -16,3 +16,7 @@ Minimal Terminal E-book Reader - supports .txt and .pdf format
 ## Requirements
 
 pdftotext, mutool or ps2ascii
+
+## Usage
+
+Run ./litereader or ./litereader <file>
