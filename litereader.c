@@ -1,23 +1,28 @@
 /*
  * Keys:
- *   n / l / Space / → / ↓      next page
- *   p / h / Backspace / ← / ↑  previous page
- *   g                           first page
- *   G                           last page
- *   :<number> Enter             jump to page
- *   q / Q                       quit  (progress auto-saved)
+ * n / l / Space / → / ↓      next page
+ * p / h / Backspace / ← / ↑  previous page
+ * g                           first page
+ * G                           last page
+ * :<number> Enter             jump to page
+ * q / Q                       quit  (progress auto-saved)
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <termios.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <pwd.h>
 
 #define SIDE_MARGIN   3
 #define LINE_BUF_CAP  65536
 
 static struct termios g_orig_term;
+static int g_raw_mode = 0;
 
 static void term_restore(void)
 {
@@ -27,6 +32,7 @@ static void term_restore(void)
 
 static void term_raw(void)
 {
+    if (g_raw_mode) return;
     tcgetattr(STDIN_FILENO, &g_orig_term);
     atexit(term_restore);
     struct termios raw = g_orig_term;
@@ -35,6 +41,7 @@ static void term_raw(void)
     raw.c_cc[VMIN]  = 1;
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    g_raw_mode = 1;
 }
 
 static void term_size(int *rows, int *cols)
@@ -112,7 +119,6 @@ static int file_is_pdf(const char *path)
            magic[2] == 'D' && magic[3] == 'F';
 }
 
-
 static char *shell_quote(const char *s)
 {
     size_t len = strlen(s);
@@ -145,17 +151,13 @@ static FILE *open_pdf_stream(const char *path)
     FILE *f = NULL;
 
     if (cmd_exists("pdftotext")) {
-        /* -layout preserves column layout; "-" sends output to stdout */
-        snprintf(cmd, sizeof cmd,
-                 "pdftotext -layout %s - 2>/dev/null", qpath);
+        snprintf(cmd, sizeof cmd, "pdftotext -layout %s - 2>/dev/null", qpath);
         f = popen(cmd, "r");
     } else if (cmd_exists("mutool")) {
-        snprintf(cmd, sizeof cmd,
-                 "mutool draw -F text %s 2>/dev/null", qpath);
+        snprintf(cmd, sizeof cmd, "mutool draw -F text %s 2>/dev/null", qpath);
         f = popen(cmd, "r");
     } else if (cmd_exists("ps2ascii")) {
-        snprintf(cmd, sizeof cmd,
-                 "ps2ascii %s 2>/dev/null", qpath);
+        snprintf(cmd, sizeof cmd, "ps2ascii %s 2>/dev/null", qpath);
         f = popen(cmd, "r");
     }
 
@@ -177,7 +179,6 @@ static StrVec load_stream(FILE *f, int is_popen, int width)
         if (n > 0 && line[0] == '\f') {
             memmove(line, line + 1, (size_t)n--);
         }
-
         wrap_line(&sv, line, width);
     }
     free(line);
@@ -190,13 +191,28 @@ static StrVec load_stream(FILE *f, int is_popen, int width)
 static StrVec load_text(const char *path, int width)
 {
     FILE *f = fopen(path, "r");
-    if (!f) { perror(path); exit(1); }
+    if (!f) { term_restore(); perror(path); exit(1); }
     return load_stream(f, 0, width);
 }
 
+/* ── Save config and progress setup ── */
 static void progress_path(const char *book, char *out, int outsz)
 {
-    snprintf(out, (size_t)outsz, "%s.progress", book);
+    const char *home = getenv("HOME");
+    if (!home) {
+        struct passwd *pw = getpwuid(getuid());
+        if (pw) home = pw->pw_dir;
+    }
+    if (!home) home = "."; 
+
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/.litereader", home);
+    mkdir(dir, 0755); 
+
+    const char *base = strrchr(book, '/');
+    base = base ? base + 1 : book;
+
+    snprintf(out, (size_t)outsz, "%s/%s.progress", dir, base);
 }
 
 static int load_progress(const char *book)
@@ -297,13 +313,124 @@ static int read_key(void)
     return '\033';
 }
 
+/* ── TUI File Picker Implementation ── */
+static int cmp_file(const void *a, const void *b) {
+    const char *sa = *(const char **)a;
+    const char *sb = *(const char **)b;
+    const char *base_a = strrchr(sa, '/'); base_a = base_a ? base_a + 1 : sa;
+    const char *base_b = strrchr(sb, '/'); base_b = base_b ? base_b + 1 : sb;
+    return strcasecmp(base_a, base_b);
+}
+
+static void scan_downloads(StrVec *sv) {
+    const char *home = getenv("HOME");
+    if (!home) {
+        struct passwd *pw = getpwuid(getuid());
+        if (pw) home = pw->pw_dir;
+    }
+    if (!home) return;
+
+    char dir_path[1024];
+    snprintf(dir_path, sizeof(dir_path), "%s/Downloads", home);
+
+    DIR *d = opendir(dir_path);
+    if (!d) return;
+
+    struct dirent *dir;
+    while ((dir = readdir(d)) != NULL) {
+        if (dir->d_name[0] == '.') continue; // Skip hidden
+        
+        const char *ext = strrchr(dir->d_name, '.');
+        if (ext && (strcasecmp(ext, ".pdf") == 0 || strcasecmp(ext, ".txt") == 0)) {
+            char full_path[2048];
+            snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, dir->d_name);
+            sv_push(sv, full_path);
+        }
+    }
+    closedir(d);
+
+    if (sv->n > 0) {
+        qsort(sv->v, sv->n, sizeof(char *), cmp_file);
+    }
+}
+
+static char *file_picker(void) {
+    StrVec files;
+    sv_init(&files);
+    scan_downloads(&files);
+
+    if (files.n == 0) {
+        sv_free(&files);
+        return NULL;
+    }
+
+    int sel = 0, offset = 0;
+    int rows, cols;
+    char *chosen = NULL;
+
+    while (1) {
+        term_size(&rows, &cols);
+        write(STDOUT_FILENO, ESC_CLEAR, strlen(ESC_CLEAR));
+
+        printf(ESC_INVERT " %-*.*s " ESC_RESET "\n",
+               cols - 2, cols - 2, "Select a file from ~/Downloads (q to quit, j/k to navigate)");
+
+        int list_rows = rows - 2;
+        if (list_rows < 1) list_rows = 1;
+
+        if (sel < offset) offset = sel;
+        if (sel >= offset + list_rows) offset = sel - list_rows + 1;
+
+        for (int i = 0; i < list_rows; i++) {
+            int idx = i + offset;
+            if (idx >= files.n) break;
+
+            const char *base = strrchr(files.v[idx], '/');
+            base = base ? base + 1 : files.v[idx];
+
+            if (idx == sel) {
+                printf(ESC_INVERT " > %s " ESC_RESET "\n", base);
+            } else {
+                printf("   %s\n", base);
+            }
+        }
+
+        int key = read_key();
+        if (key == 'q' || key == 'Q' || key == '\033') {
+            break;
+        } else if (key == KEY_UP || key == 'k') {
+            if (sel > 0) sel--;
+        } else if (key == KEY_DOWN || key == 'j') {
+            if (sel < files.n - 1) sel++;
+        } else if (key == '\r' || key == '\n') {
+            chosen = strdup(files.v[sel]);
+            break;
+        }
+    }
+
+    sv_free(&files);
+    return chosen;
+}
+
 int main(int argc, char *argv[])
 {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <file.txt|file.pdf>\n", argv[0]);
-        return 1;
+    char *picked_file = NULL;
+    const char *path = NULL;
+
+    term_raw();
+    write(STDOUT_FILENO, "\033[?25l", 6);
+
+    if (argc >= 2) {
+        path = argv[1];
+    } else {
+        picked_file = file_picker();
+        if (!picked_file) {
+            write(STDOUT_FILENO, ESC_CLEAR, strlen(ESC_CLEAR));
+            printf("No file selected or ~/Downloads is empty.\n");
+            return 0;
+        }
+        path = picked_file;
     }
-    const char *path = argv[1];
 
     int rows, cols;
     term_size(&rows, &cols);
@@ -315,18 +442,16 @@ int main(int argc, char *argv[])
     StrVec sv;
 
     if (file_is_pdf(path)) {
-        fprintf(stderr, "PDF detected — extracting text…\n");
         FILE *pf = open_pdf_stream(path);
         if (!pf) {
+            term_restore();
             fprintf(stderr,
                 "Error: no PDF-to-text converter found on PATH.\n"
                 "Install one of:\n"
-                "  pdftotext  ->  sudo apt install poppler-utils  "
-                            "| brew install poppler\n"
-                "  mutool     ->  sudo apt install mupdf-tools    "
-                            "| brew install mupdf-tools\n"
-                "  ps2ascii   ->  sudo apt install ghostscript    "
-                            "| brew install ghostscript\n");
+                "  pdftotext  ->  sudo apt install poppler-utils  | brew install poppler\n"
+                "  mutool     ->  sudo apt install mupdf-tools    | brew install mupdf-tools\n"
+                "  ps2ascii   ->  sudo apt install ghostscript    | brew install ghostscript\n");
+            if (picked_file) free(picked_file);
             return 1;
         }
         sv = load_stream(pf, 1 /* pclose */, wrap_width);
@@ -335,7 +460,9 @@ int main(int argc, char *argv[])
     }
 
     if (sv.n == 0) {
+        term_restore();
         fprintf(stderr, "File is empty or could not be read.\n");
+        if (picked_file) free(picked_file);
         return 1;
     }
 
@@ -349,9 +476,6 @@ int main(int argc, char *argv[])
 
     const char *title = strrchr(path, '/');
     title = title ? title + 1 : path;
-
-    term_raw();
-    write(STDOUT_FILENO, "\033[?25l", 6);
 
     render(&sv, page, rows, cols, title, NULL);
 
@@ -414,6 +538,7 @@ int main(int argc, char *argv[])
 done:
     save_progress(path, page);
     sv_free(&sv);
+    if (picked_file) free(picked_file);
     write(STDOUT_FILENO, ESC_CLEAR, strlen(ESC_CLEAR));
     printf("Progress saved at page %d. Goodbye!\n", page + 1);
     return 0;
